@@ -1,6 +1,7 @@
 # Edge PWA Icon
 
 ![GNOME Shell 45-50](https://img.shields.io/badge/GNOME%20Shell-45--50-blue)
+![Version 0.4](https://img.shields.io/badge/version-0.4-blue)
 
 **English** | [Deutsch](README.de.md)
 

@@ -2,5 +2,6 @@
     "uuid": "pwa-icons@pat9496",
     "name": "Edge PWA Icon",
     "description": "Shows each Microsoft Edge PWA (e.g. Outlook, Teams) as its own app with its own icon in Alt-Tab, the Overview, and the Dash, instead of grouping it with regular Edge windows under the generic Edge icon.",
+    "version": "0.4",
     "shell-version": ["45", "46", "47", "48", "49", "50"]
 }
