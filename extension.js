@@ -50,26 +50,30 @@ function extractAppIdFromCmdline(pid) {
 }
 
 function extractAppIdFromWindow(window) {
-    let wmClass;
+    // WM_CLASS is an instance/class pair. Chromium/Edge sets the per-app
+    // "crx__<app-id>" value on the *instance* part (get_wm_class_instance())
+    // and leaves the *class* part (get_wm_class()) as a generic string shared
+    // by every window -- reading get_wm_class() here never matches any
+    // window, PWA or not.
+    let wmClassInstance;
     try {
-        wmClass = window.get_wm_class();
+        wmClassInstance = window.get_wm_class_instance();
     } catch (e) {
         return null;
     }
-    if (!wmClass)
+    if (!wmClassInstance)
         return null;
 
-    // Chromium sets each installed web app's window WM_CLASS/app-id to
-    // "crx__<app-id>" (this is what desktop files record as StartupWMClass)
-    // individually per window, at window-creation time. This stays correct
-    // even when several PWAs installed under the same --profile-directory get
-    // merged by Chromium into a single shared browser process ("Opening in
-    // existing browser session") whose /proc/<pid>/cmdline only ever reflects
+    // This is what desktop files record as StartupWMClass, set individually
+    // per window at window-creation time. This stays correct even when
+    // several PWAs installed under the same --profile-directory get merged by
+    // Chromium into a single shared browser process ("Opening in existing
+    // browser session") whose /proc/<pid>/cmdline only ever reflects
     // whichever PWA first launched that process -- confirmed live: opening a
     // second PWA under the same profile does not spawn a new --app-id=...
     // process, so cmdline-based extraction alone misidentifies every PWA
     // window in that process as the first one launched.
-    const match = CRX_WM_CLASS_RE.exec(wmClass);
+    const match = CRX_WM_CLASS_RE.exec(wmClassInstance);
     return match ? match[1] : null;
 }
 
@@ -131,9 +135,20 @@ class EdgePwaResolver {
         if (!isEdgeExecutable(pid))
             return null;
 
-        // Prefer the window's own WM_CLASS (per-window ground truth); fall
-        // back to the process cmdline only if WM_CLASS isn't available yet.
-        const appId = extractAppIdFromWindow(window) ?? extractAppIdFromCmdline(pid);
+        // Prefer the window's own WM_CLASS instance (per-window ground
+        // truth). Only fall back to the process cmdline's --app-id= when this
+        // process currently owns exactly one window: Edge can reuse a single
+        // shared process for multiple PWAs (and regular tabs) opened under
+        // the same --profile-directory, in which case cmdline only ever
+        // reflects whichever PWA launched the process first -- trusting it
+        // for a shared process's *other* windows would misattribute them to
+        // that first PWA instead of leaving them unresolved.
+        let appId = extractAppIdFromWindow(window);
+        if (!appId) {
+            if (this._countOtherEdgeWindowsForPid(pid, window) > 0)
+                return null;
+            appId = extractAppIdFromCmdline(pid);
+        }
         if (!appId)
             return null;
 
@@ -143,6 +158,23 @@ class EdgePwaResolver {
 
         this._pwaDesktopIds.add(desktopId);
         return Shell.AppSystem.get_default().lookup_app(desktopId) ?? null;
+    }
+
+    _countOtherEdgeWindowsForPid(pid, excludeWindow) {
+        let count = 0;
+        for (const other of global.display.list_all_windows()) {
+            if (other === excludeWindow)
+                continue;
+            let otherPid;
+            try {
+                otherPid = other.get_pid();
+            } catch (e) {
+                continue;
+            }
+            if (otherPid === pid)
+                count++;
+        }
+        return count;
     }
 
     _trackWindow(window) {
@@ -161,11 +193,22 @@ class EdgePwaResolver {
     resolveApp(window) {
         if (!window)
             return null;
-        if (this._appCache.has(window))
-            return this._appCache.get(window);
+        // Cache positive resolutions permanently, but keep retrying after a
+        // null result: an early call (e.g. right at window creation, before
+        // WM_CLASS/PID info has settled, or while a sibling window still
+        // makes this process's identity ambiguous -- see
+        // _countOtherEdgeWindowsForPid) can resolve to null prematurely, and
+        // never revisiting it would lock that window out of PWA detection
+        // for its entire lifetime.
+        if (this._appCache.has(window)) {
+            const cached = this._appCache.get(window);
+            if (cached)
+                return cached;
+        }
 
         const app = this._computeAppForWindow(window);
-        this._appCache.set(window, app);
+        if (app)
+            this._appCache.set(window, app);
         this._trackWindow(window);
         if (app)
             this._maybeNotifyStateChange(app);
