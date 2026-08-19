@@ -144,15 +144,31 @@ class EdgePwaResolver {
         // for a shared process's *other* windows would misattribute them to
         // that first PWA instead of leaving them unresolved.
         let appId = extractAppIdFromWindow(window);
+        let source = 'wm_class';
         if (!appId) {
-            if (this._countOtherEdgeWindowsForPid(pid, window) > 0)
+            const otherCount = this._countOtherEdgeWindowsForPid(pid, window);
+            if (otherCount > 0) {
+                console.debug(
+                    `[pwa-icons] pid=${pid} wm_class_instance=${window.get_wm_class_instance()} ` +
+                    `title="${window.get_title()}" -> no app-id from WM_CLASS, ${otherCount} ` +
+                    'other window(s) share this pid, refusing cmdline fallback');
                 return null;
+            }
             appId = extractAppIdFromCmdline(pid);
+            source = 'cmdline';
         }
-        if (!appId)
+        if (!appId) {
+            console.debug(
+                `[pwa-icons] pid=${pid} wm_class_instance=${window.get_wm_class_instance()} ` +
+                `title="${window.get_title()}" -> no app-id resolved`);
             return null;
+        }
 
         const desktopId = this._lookupDesktopId(appId);
+        console.debug(
+            `[pwa-icons] pid=${pid} wm_class_instance=${window.get_wm_class_instance()} ` +
+            `title="${window.get_title()}" appId=${appId} (via ${source}) -> ` +
+            `desktopId=${desktopId ?? 'none'}`);
         if (!desktopId)
             return null;
 
