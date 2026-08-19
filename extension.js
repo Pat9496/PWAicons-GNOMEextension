@@ -343,29 +343,33 @@ export default class EdgePwaIconExtension extends Extension {
 
         const extension = this;
         this._originalGetWindowApp = Shell.WindowTracker.prototype.get_window_app;
-        Shell.WindowTracker.prototype.get_window_app = function (...args) {
+        this._patchedGetWindowApp = function (...args) {
             const app = extension._resolver.resolveApp(args[0]);
             if (app)
                 return app;
             return extension._originalGetWindowApp.call(this, ...args);
         };
+        Shell.WindowTracker.prototype.get_window_app = this._patchedGetWindowApp;
 
         this._originalAppGetWindows = Shell.App.prototype.get_windows;
-        Shell.App.prototype.get_windows = function (...args) {
+        this._patchedAppGetWindows = function (...args) {
             const original = extension._originalAppGetWindows.call(this, ...args);
             return extension._resolver.getWindowsForApp(this, original);
         };
+        Shell.App.prototype.get_windows = this._patchedAppGetWindows;
 
         this._originalAppGetNWindows = Shell.App.prototype.get_n_windows;
-        Shell.App.prototype.get_n_windows = function () {
+        this._patchedAppGetNWindows = function () {
             return this.get_windows().length;
         };
+        Shell.App.prototype.get_n_windows = this._patchedAppGetNWindows;
 
         this._originalGetRunning = Shell.AppSystem.prototype.get_running;
-        Shell.AppSystem.prototype.get_running = function (...args) {
+        this._patchedGetRunning = function (...args) {
             const original = extension._originalGetRunning.call(this, ...args);
             return extension._resolver.getRunningApps(original);
         };
+        Shell.AppSystem.prototype.get_running = this._patchedGetRunning;
 
         // Clicking a Dash/pinned PWA icon should focus its existing window
         // rather than launching a new instance. Shell.App.activate()'s own
@@ -375,7 +379,7 @@ export default class EdgePwaIconExtension extends Extension {
         // only, using our own get_windows() (already patched, above) as the
         // source of truth; every other app keeps the original behavior.
         this._originalActivate = Shell.App.prototype.activate;
-        Shell.App.prototype.activate = function (...args) {
+        this._patchedActivate = function (...args) {
             if (!extension._resolver.isPwaApp(this))
                 return extension._originalActivate.call(this, ...args);
 
@@ -388,6 +392,7 @@ export default class EdgePwaIconExtension extends Extension {
             Main.activateWindow(window);
             return undefined;
         };
+        Shell.App.prototype.activate = this._patchedActivate;
 
         // Best-effort fix for the Dash running-indicator dot: Shell.App:state
         // is a GObject property backed by the same internal C-side tracking
@@ -401,18 +406,19 @@ export default class EdgePwaIconExtension extends Extension {
         if (this._originalStateDescriptor &&
             typeof this._originalStateDescriptor.get === 'function') {
             const originalStateGetter = this._originalStateDescriptor.get;
+            this._patchedStateGetter = function () {
+                const original = originalStateGetter.call(this);
+                if (original !== Shell.AppState.STOPPED)
+                    return original;
+                if (extension._resolver.isPwaApp(this) &&
+                    this.get_windows().length > 0)
+                    return Shell.AppState.RUNNING;
+                return original;
+            };
             Object.defineProperty(Shell.App.prototype, 'state', {
                 configurable: true,
                 enumerable: this._originalStateDescriptor.enumerable,
-                get: function () {
-                    const original = originalStateGetter.call(this);
-                    if (original !== Shell.AppState.STOPPED)
-                        return original;
-                    if (extension._resolver.isPwaApp(this) &&
-                        this.get_windows().length > 0)
-                        return Shell.AppState.RUNNING;
-                    return original;
-                },
+                get: this._patchedStateGetter,
             });
         } else {
             this._originalStateDescriptor = null;
@@ -424,24 +430,43 @@ export default class EdgePwaIconExtension extends Extension {
     }
 
     disable() {
-        if (this._originalStateDescriptor)
+        // Each restore below only fires if this extension's own patch is still
+        // in place. Another extension may have patched the same Shell
+        // prototype method/property after this one enabled; blindly restoring
+        // our saved "original" in that case would erase that extension's
+        // patch instead of just undoing ours.
+        const currentStateDescriptor =
+            Object.getOwnPropertyDescriptor(Shell.App.prototype, 'state');
+        if (this._originalStateDescriptor &&
+            currentStateDescriptor?.get === this._patchedStateGetter)
             Object.defineProperty(Shell.App.prototype, 'state', this._originalStateDescriptor);
         this._originalStateDescriptor = null;
+        this._patchedStateGetter = null;
 
-        Shell.App.prototype.activate = this._originalActivate;
+        if (Shell.App.prototype.activate === this._patchedActivate)
+            Shell.App.prototype.activate = this._originalActivate;
         this._originalActivate = null;
+        this._patchedActivate = null;
 
-        Shell.AppSystem.prototype.get_running = this._originalGetRunning;
+        if (Shell.AppSystem.prototype.get_running === this._patchedGetRunning)
+            Shell.AppSystem.prototype.get_running = this._originalGetRunning;
         this._originalGetRunning = null;
+        this._patchedGetRunning = null;
 
-        Shell.App.prototype.get_n_windows = this._originalAppGetNWindows;
+        if (Shell.App.prototype.get_n_windows === this._patchedAppGetNWindows)
+            Shell.App.prototype.get_n_windows = this._originalAppGetNWindows;
         this._originalAppGetNWindows = null;
+        this._patchedAppGetNWindows = null;
 
-        Shell.App.prototype.get_windows = this._originalAppGetWindows;
+        if (Shell.App.prototype.get_windows === this._patchedAppGetWindows)
+            Shell.App.prototype.get_windows = this._originalAppGetWindows;
         this._originalAppGetWindows = null;
+        this._patchedAppGetWindows = null;
 
-        Shell.WindowTracker.prototype.get_window_app = this._originalGetWindowApp;
+        if (Shell.WindowTracker.prototype.get_window_app === this._patchedGetWindowApp)
+            Shell.WindowTracker.prototype.get_window_app = this._originalGetWindowApp;
         this._originalGetWindowApp = null;
+        this._patchedGetWindowApp = null;
 
         this._resolver.destroy();
         this._resolver = null;
