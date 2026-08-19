@@ -50,21 +50,30 @@ function extractAppIdFromCmdline(pid) {
     return match ? match[1] : null;
 }
 
+// Safely calls `getter()` and matches its result against `regex`, swallowing
+// any exception the getter throws (window properties like WM_CLASS can throw
+// on a window that's mid-teardown). Returns the first capture group, or null.
+function tryMatchGetter(getter, regex) {
+    let value;
+    try {
+        value = getter();
+    } catch (e) {
+        return null;
+    }
+    if (!value)
+        return null;
+
+    const match = regex.exec(value);
+    return match ? match[1] : null;
+}
+
 function extractAppIdFromWindow(window) {
     // WM_CLASS is an instance/class pair. Chromium-family browsers set the
     // per-app "crx_<app-id>" value on the *instance* part
     // (get_wm_class_instance()) and leave the *class* part (get_wm_class())
     // as a generic string shared by every window -- reading get_wm_class()
     // here never matches any window, PWA or not.
-    let wmClassInstance;
-    try {
-        wmClassInstance = window.get_wm_class_instance();
-    } catch (e) {
-        return null;
-    }
-    if (!wmClassInstance)
-        return null;
-
+    //
     // This is what desktop files record as StartupWMClass, set individually
     // per window at window-creation time. This stays correct even when
     // several PWAs installed under the same --profile-directory get merged by
@@ -74,74 +83,65 @@ function extractAppIdFromWindow(window) {
     // second PWA under the same profile does not spawn a new --app-id=...
     // process, so cmdline-based extraction alone misidentifies every PWA
     // window in that process as the first one launched.
-    const match = CRX_WM_CLASS_RE.exec(wmClassInstance);
-    return match ? match[1] : null;
+    return tryMatchGetter(() => window.get_wm_class_instance(), CRX_WM_CLASS_RE);
 }
 
 function extractFirefoxPwaSiteId(window) {
-    let wmClassInstance;
-    try {
-        wmClassInstance = window.get_wm_class_instance();
-    } catch (e) {
-        wmClassInstance = null;
-    }
-    if (wmClassInstance) {
-        const match = FFPWA_WM_CLASS_RE.exec(wmClassInstance);
-        if (match)
-            return match[1].toUpperCase();
-    }
+    // Unlike Chromium's WM_CLASS convention (always the instance part),
+    // it's unconfirmed which half of the WM_CLASS pair firefoxpwa's --class
+    // flag sets, so both are tried.
+    const instanceMatch = tryMatchGetter(() => window.get_wm_class_instance(), FFPWA_WM_CLASS_RE);
+    if (instanceMatch)
+        return instanceMatch.toUpperCase();
 
-    let wmClass;
-    try {
-        wmClass = window.get_wm_class();
-    } catch (e) {
-        wmClass = null;
-    }
-    if (wmClass) {
-        const match = FFPWA_WM_CLASS_RE.exec(wmClass);
-        if (match)
-            return match[1].toUpperCase();
-    }
-
-    return null;
+    const classMatch = tryMatchGetter(() => window.get_wm_class(), FFPWA_WM_CLASS_RE);
+    return classMatch ? classMatch.toUpperCase() : null;
 }
 
-function buildAppIdMap() {
+// Builds a Map from whatever id `extractIdFromAppInfo` derives from each
+// installed desktop entry to that entry's own desktop-file id. Shared by the
+// Chromium and Firefox paths below, which differ only in what they extract.
+function buildIdMap(extractIdFromAppInfo) {
     const map = new Map();
     for (const appInfo of Gio.AppInfo.get_all()) {
-        const commandline = appInfo.get_commandline();
-        if (!commandline)
-            continue;
-
-        const match = APP_ID_RE.exec(commandline);
-        if (match)
-            map.set(match[1], appInfo.get_id());
+        const id = extractIdFromAppInfo(appInfo);
+        if (id)
+            map.set(id, appInfo.get_id());
     }
     return map;
 }
 
-function buildFirefoxPwaMap() {
-    const map = new Map();
-    for (const appInfo of Gio.AppInfo.get_all()) {
-        const getStartupWmClass = appInfo.get_startup_wm_class?.bind(appInfo);
-        if (!getStartupWmClass)
-            return map;
+function extractChromiumAppIdFromAppInfo(appInfo) {
+    const commandline = appInfo.get_commandline();
+    return commandline ? APP_ID_RE.exec(commandline)?.[1] ?? null : null;
+}
 
-        const startupWmClass = getStartupWmClass();
-        if (!startupWmClass)
-            continue;
+function extractFirefoxPwaSiteIdFromAppInfo(appInfo) {
+    // get_startup_wm_class() is a Gio.DesktopAppInfo method that may not
+    // exist on every GNOME Shell version's GJS/GLib bindings; if it's
+    // missing, every entry simply yields no id, leaving the map empty and
+    // Firefox detection silently disabled (same feature-detection pattern
+    // used for Shell.App:state in the extension class below).
+    if (typeof appInfo.get_startup_wm_class !== 'function')
+        return null;
 
-        const match = FFPWA_WM_CLASS_RE.exec(startupWmClass);
-        if (match)
-            map.set(match[1].toUpperCase(), appInfo.get_id());
-    }
-    return map;
+    const startupWmClass = appInfo.get_startup_wm_class();
+    if (!startupWmClass)
+        return null;
+
+    const match = FFPWA_WM_CLASS_RE.exec(startupWmClass);
+    return match ? match[1].toUpperCase() : null;
 }
 
 class PwaResolver {
     constructor() {
-        this._chromiumAppIdMap = null;
-        this._firefoxPwaSiteIdMap = null;
+        // Each entry lazily builds (and, on a cache miss, rebuilds once --
+        // in case the AppInfoMonitor 'changed' signal below was missed) a
+        // Map from whatever id its `builder` extracts to a desktop-file id.
+        this._idMaps = {
+            chromium: {map: null, builder: () => buildIdMap(extractChromiumAppIdFromAppInfo)},
+            firefoxPwa: {map: null, builder: () => buildIdMap(extractFirefoxPwaSiteIdFromAppInfo)},
+        };
         this._appCache = new WeakMap();
         this._windowSignalIds = new Map();
         this._pwaDesktopIds = new Set();
@@ -149,41 +149,28 @@ class PwaResolver {
 
         this._appInfoMonitor = Gio.AppInfoMonitor.get();
         this._appInfoChangedId = this._appInfoMonitor.connect('changed', () => {
-            this._chromiumAppIdMap = null;
-            this._firefoxPwaSiteIdMap = null;
+            for (const entry of Object.values(this._idMaps))
+                entry.map = null;
         });
     }
 
-    _ensureChromiumAppIdMap() {
-        if (!this._chromiumAppIdMap)
-            this._chromiumAppIdMap = buildAppIdMap();
-        return this._chromiumAppIdMap;
-    }
-
-    _lookupChromiumDesktopId(appId) {
-        const map = this._ensureChromiumAppIdMap();
-        let desktopId = map.get(appId);
+    _lookupDesktopId(family, id) {
+        const entry = this._idMaps[family];
+        if (!entry.map)
+            entry.map = entry.builder();
+        let desktopId = entry.map.get(id);
         if (!desktopId) {
-            this._chromiumAppIdMap = buildAppIdMap();
-            desktopId = this._chromiumAppIdMap.get(appId);
+            entry.map = entry.builder();
+            desktopId = entry.map.get(id);
         }
         return desktopId ?? null;
     }
 
-    _ensureFirefoxPwaMap() {
-        if (!this._firefoxPwaSiteIdMap)
-            this._firefoxPwaSiteIdMap = buildFirefoxPwaMap();
-        return this._firefoxPwaSiteIdMap;
-    }
-
-    _lookupFirefoxPwaDesktopId(siteId) {
-        const map = this._ensureFirefoxPwaMap();
-        let desktopId = map.get(siteId);
-        if (!desktopId) {
-            this._firefoxPwaSiteIdMap = buildFirefoxPwaMap();
-            desktopId = this._firefoxPwaSiteIdMap.get(siteId);
-        }
-        return desktopId ?? null;
+    _resolveDesktopId(desktopId) {
+        if (!desktopId)
+            return null;
+        this._pwaDesktopIds.add(desktopId);
+        return Shell.AppSystem.get_default().lookup_app(desktopId) ?? null;
     }
 
     _computeAppForWindow(window) {
@@ -227,29 +214,20 @@ class PwaResolver {
                 return null;
             }
 
-            const desktopId = this._lookupChromiumDesktopId(appId);
+            const desktopId = this._lookupDesktopId('chromium', appId);
             console.debug(
                 `[pwa-separation] pid=${pid} wm_class_instance=${window.get_wm_class_instance()} ` +
                 `title="${window.get_title()}" appId=${appId} (via ${source}) -> ` +
                 `desktopId=${desktopId ?? 'none'}`);
-            if (!desktopId)
-                return null;
-
-            this._pwaDesktopIds.add(desktopId);
-            return Shell.AppSystem.get_default().lookup_app(desktopId) ?? null;
+            return this._resolveDesktopId(desktopId);
         }
 
         const siteId = extractFirefoxPwaSiteId(window);
         if (siteId) {
-            const desktopId = this._lookupFirefoxPwaDesktopId(siteId);
+            const desktopId = this._lookupDesktopId('firefoxPwa', siteId);
             console.debug(
-                `[pwa-separation] pid=${pid} wm_class=${window.get_wm_class()} ` +
-                `siteId=${siteId} -> desktopId=${desktopId ?? 'none'}`);
-            if (!desktopId)
-                return null;
-
-            this._pwaDesktopIds.add(desktopId);
-            return Shell.AppSystem.get_default().lookup_app(desktopId) ?? null;
+                `[pwa-separation] pid=${pid} siteId=${siteId} -> desktopId=${desktopId ?? 'none'}`);
+            return this._resolveDesktopId(desktopId);
         }
 
         return null;
@@ -410,8 +388,8 @@ class PwaResolver {
         this._windowSignalIds.clear();
 
         this._appCache = new WeakMap();
-        this._chromiumAppIdMap = null;
-        this._firefoxPwaSiteIdMap = null;
+        for (const entry of Object.values(this._idMaps))
+            entry.map = null;
         this._pwaDesktopIds.clear();
         this._pwaAppWindowCounts.clear();
     }
