@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-readonly UUID="pwa-icons@pat9496"
+readonly UUID="pwa-separation@pat9496"
 readonly REPO_DIR="$(dirname "$(readlink -f "$0")")"
 readonly EXT_PARENT_DIR="${HOME}/.local/share/gnome-shell/extensions"
 readonly TARGET_DIR="${EXT_PARENT_DIR}/${UUID}"

@@ -5,11 +5,12 @@ import Shell from 'gi://Shell';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 
-const EDGE_BINARY_RE = /^(microsoft-edge|msedge)(-(beta|dev|canary))?$/i;
+const CHROMIUM_BINARY_RE = /^(google-chrome|chrome|chromium|chromium-browser|brave|brave-browser|vivaldi|vivaldi-stable|opera|microsoft-edge|msedge)(-(beta|dev|canary|nightly|unstable|snapshot))?$/i;
 const APP_ID_RE = /--app-id=([A-Za-z0-9]+)/;
-const CRX_WM_CLASS_RE = /^crx__([A-Za-z0-9]+)$/i;
+const CRX_WM_CLASS_RE = /^crx_+([A-Za-z0-9]+)$/i;
+const FFPWA_WM_CLASS_RE = /^FFPWA-([0-9A-HJKMNP-TV-Z]{26})$/i;
 
-function isEdgeExecutable(pid) {
+function isChromiumExecutable(pid) {
     let exePath;
     try {
         exePath = GLib.file_read_link(`/proc/${pid}/exe`);
@@ -20,7 +21,7 @@ function isEdgeExecutable(pid) {
         return false;
 
     const basename = GLib.path_get_basename(exePath);
-    return EDGE_BINARY_RE.test(basename);
+    return CHROMIUM_BINARY_RE.test(basename);
 }
 
 function extractAppIdFromCmdline(pid) {
@@ -41,7 +42,7 @@ function extractAppIdFromCmdline(pid) {
     }
 
     // /proc/<pid>/cmdline is normally NUL-separated argv, but some sandboxed
-    // Chromium/Edge processes (observed with Flatpak's zypak-helper) rewrite
+    // Chromium processes (observed with Flatpak's zypak-helper) rewrite
     // their own cmdline into a single space-joined string for a friendlier
     // process title, collapsing the NUL separators. Matching the flag pattern
     // against the raw decoded string (NUL bytes included) works for both forms.
@@ -50,11 +51,11 @@ function extractAppIdFromCmdline(pid) {
 }
 
 function extractAppIdFromWindow(window) {
-    // WM_CLASS is an instance/class pair. Chromium/Edge sets the per-app
-    // "crx__<app-id>" value on the *instance* part (get_wm_class_instance())
-    // and leaves the *class* part (get_wm_class()) as a generic string shared
-    // by every window -- reading get_wm_class() here never matches any
-    // window, PWA or not.
+    // WM_CLASS is an instance/class pair. Chromium-family browsers set the
+    // per-app "crx_<app-id>" value on the *instance* part
+    // (get_wm_class_instance()) and leave the *class* part (get_wm_class())
+    // as a generic string shared by every window -- reading get_wm_class()
+    // here never matches any window, PWA or not.
     let wmClassInstance;
     try {
         wmClassInstance = window.get_wm_class_instance();
@@ -67,14 +68,42 @@ function extractAppIdFromWindow(window) {
     // This is what desktop files record as StartupWMClass, set individually
     // per window at window-creation time. This stays correct even when
     // several PWAs installed under the same --profile-directory get merged by
-    // Chromium into a single shared browser process ("Opening in existing
-    // browser session") whose /proc/<pid>/cmdline only ever reflects
-    // whichever PWA first launched that process -- confirmed live: opening a
+    // the browser into a single shared process ("Opening in existing browser
+    // session") whose /proc/<pid>/cmdline only ever reflects whichever PWA
+    // first launched that process -- confirmed live with Edge: opening a
     // second PWA under the same profile does not spawn a new --app-id=...
     // process, so cmdline-based extraction alone misidentifies every PWA
     // window in that process as the first one launched.
     const match = CRX_WM_CLASS_RE.exec(wmClassInstance);
     return match ? match[1] : null;
+}
+
+function extractFirefoxPwaSiteId(window) {
+    let wmClassInstance;
+    try {
+        wmClassInstance = window.get_wm_class_instance();
+    } catch (e) {
+        wmClassInstance = null;
+    }
+    if (wmClassInstance) {
+        const match = FFPWA_WM_CLASS_RE.exec(wmClassInstance);
+        if (match)
+            return match[1].toUpperCase();
+    }
+
+    let wmClass;
+    try {
+        wmClass = window.get_wm_class();
+    } catch (e) {
+        wmClass = null;
+    }
+    if (wmClass) {
+        const match = FFPWA_WM_CLASS_RE.exec(wmClass);
+        if (match)
+            return match[1].toUpperCase();
+    }
+
+    return null;
 }
 
 function buildAppIdMap() {
@@ -91,9 +120,28 @@ function buildAppIdMap() {
     return map;
 }
 
-class EdgePwaResolver {
+function buildFirefoxPwaMap() {
+    const map = new Map();
+    for (const appInfo of Gio.AppInfo.get_all()) {
+        const getStartupWmClass = appInfo.get_startup_wm_class?.bind(appInfo);
+        if (!getStartupWmClass)
+            return map;
+
+        const startupWmClass = getStartupWmClass();
+        if (!startupWmClass)
+            continue;
+
+        const match = FFPWA_WM_CLASS_RE.exec(startupWmClass);
+        if (match)
+            map.set(match[1].toUpperCase(), appInfo.get_id());
+    }
+    return map;
+}
+
+class PwaResolver {
     constructor() {
-        this._appIdToDesktopId = null;
+        this._chromiumAppIdMap = null;
+        this._firefoxPwaSiteIdMap = null;
         this._appCache = new WeakMap();
         this._windowSignalIds = new Map();
         this._pwaDesktopIds = new Set();
@@ -101,23 +149,39 @@ class EdgePwaResolver {
 
         this._appInfoMonitor = Gio.AppInfoMonitor.get();
         this._appInfoChangedId = this._appInfoMonitor.connect('changed', () => {
-            this._appIdToDesktopId = null;
+            this._chromiumAppIdMap = null;
+            this._firefoxPwaSiteIdMap = null;
         });
     }
 
-    _ensureAppIdMap() {
-        if (!this._appIdToDesktopId)
-            this._appIdToDesktopId = buildAppIdMap();
-        return this._appIdToDesktopId;
+    _ensureChromiumAppIdMap() {
+        if (!this._chromiumAppIdMap)
+            this._chromiumAppIdMap = buildAppIdMap();
+        return this._chromiumAppIdMap;
     }
 
-    _lookupDesktopId(appId) {
-        const map = this._ensureAppIdMap();
+    _lookupChromiumDesktopId(appId) {
+        const map = this._ensureChromiumAppIdMap();
         let desktopId = map.get(appId);
         if (!desktopId) {
-            // Cache miss: refresh in case the AppInfoMonitor 'changed' signal was missed.
-            this._appIdToDesktopId = buildAppIdMap();
-            desktopId = this._appIdToDesktopId.get(appId);
+            this._chromiumAppIdMap = buildAppIdMap();
+            desktopId = this._chromiumAppIdMap.get(appId);
+        }
+        return desktopId ?? null;
+    }
+
+    _ensureFirefoxPwaMap() {
+        if (!this._firefoxPwaSiteIdMap)
+            this._firefoxPwaSiteIdMap = buildFirefoxPwaMap();
+        return this._firefoxPwaSiteIdMap;
+    }
+
+    _lookupFirefoxPwaDesktopId(siteId) {
+        const map = this._ensureFirefoxPwaMap();
+        let desktopId = map.get(siteId);
+        if (!desktopId) {
+            this._firefoxPwaSiteIdMap = buildFirefoxPwaMap();
+            desktopId = this._firefoxPwaSiteIdMap.get(siteId);
         }
         return desktopId ?? null;
     }
@@ -132,51 +196,66 @@ class EdgePwaResolver {
         if (!pid || pid <= 0)
             return null;
 
-        if (!isEdgeExecutable(pid))
-            return null;
-
-        // Prefer the window's own WM_CLASS instance (per-window ground
-        // truth). Only fall back to the process cmdline's --app-id= when this
-        // process currently owns exactly one window: Edge can reuse a single
-        // shared process for multiple PWAs (and regular tabs) opened under
-        // the same --profile-directory, in which case cmdline only ever
-        // reflects whichever PWA launched the process first -- trusting it
-        // for a shared process's *other* windows would misattribute them to
-        // that first PWA instead of leaving them unresolved.
-        let appId = extractAppIdFromWindow(window);
-        let source = 'wm_class';
-        if (!appId) {
-            const otherCount = this._countOtherEdgeWindowsForPid(pid, window);
-            if (otherCount > 0) {
+        if (isChromiumExecutable(pid)) {
+            // Prefer the window's own WM_CLASS instance (per-window ground
+            // truth). Only fall back to the process cmdline's --app-id= when
+            // this process currently owns exactly one window: Chromium-family
+            // browsers can reuse a single shared process for multiple PWAs
+            // (and regular tabs) opened under the same --profile-directory,
+            // in which case cmdline only ever reflects whichever PWA launched
+            // the process first -- trusting it for a shared process's *other*
+            // windows would misattribute them to that first PWA instead of
+            // leaving them unresolved.
+            let appId = extractAppIdFromWindow(window);
+            let source = 'wm_class';
+            if (!appId) {
+                const otherCount = this._countOtherWindowsForPid(pid, window);
+                if (otherCount > 0) {
+                    console.debug(
+                        `[pwa-separation] pid=${pid} wm_class_instance=${window.get_wm_class_instance()} ` +
+                        `title="${window.get_title()}" -> no app-id from WM_CLASS, ${otherCount} ` +
+                        'other window(s) share this pid, refusing cmdline fallback');
+                    return null;
+                }
+                appId = extractAppIdFromCmdline(pid);
+                source = 'cmdline';
+            }
+            if (!appId) {
                 console.debug(
-                    `[pwa-icons] pid=${pid} wm_class_instance=${window.get_wm_class_instance()} ` +
-                    `title="${window.get_title()}" -> no app-id from WM_CLASS, ${otherCount} ` +
-                    'other window(s) share this pid, refusing cmdline fallback');
+                    `[pwa-separation] pid=${pid} wm_class_instance=${window.get_wm_class_instance()} ` +
+                    `title="${window.get_title()}" -> no app-id resolved`);
                 return null;
             }
-            appId = extractAppIdFromCmdline(pid);
-            source = 'cmdline';
-        }
-        if (!appId) {
+
+            const desktopId = this._lookupChromiumDesktopId(appId);
             console.debug(
-                `[pwa-icons] pid=${pid} wm_class_instance=${window.get_wm_class_instance()} ` +
-                `title="${window.get_title()}" -> no app-id resolved`);
-            return null;
+                `[pwa-separation] pid=${pid} wm_class_instance=${window.get_wm_class_instance()} ` +
+                `title="${window.get_title()}" appId=${appId} (via ${source}) -> ` +
+                `desktopId=${desktopId ?? 'none'}`);
+            if (!desktopId)
+                return null;
+
+            this._pwaDesktopIds.add(desktopId);
+            return Shell.AppSystem.get_default().lookup_app(desktopId) ?? null;
         }
 
-        const desktopId = this._lookupDesktopId(appId);
-        console.debug(
-            `[pwa-icons] pid=${pid} wm_class_instance=${window.get_wm_class_instance()} ` +
-            `title="${window.get_title()}" appId=${appId} (via ${source}) -> ` +
-            `desktopId=${desktopId ?? 'none'}`);
-        if (!desktopId)
-            return null;
+        const siteId = extractFirefoxPwaSiteId(window);
+        if (siteId) {
+            const desktopId = this._lookupFirefoxPwaDesktopId(siteId);
+            console.debug(
+                `[pwa-separation] pid=${pid} wm_class=${window.get_wm_class()} ` +
+                `siteId=${siteId} -> desktopId=${desktopId ?? 'none'}`);
+            if (!desktopId)
+                return null;
 
-        this._pwaDesktopIds.add(desktopId);
-        return Shell.AppSystem.get_default().lookup_app(desktopId) ?? null;
+            this._pwaDesktopIds.add(desktopId);
+            return Shell.AppSystem.get_default().lookup_app(desktopId) ?? null;
+        }
+
+        return null;
     }
 
-    _countOtherEdgeWindowsForPid(pid, excludeWindow) {
+    _countOtherWindowsForPid(pid, excludeWindow) {
         let count = 0;
         for (const other of global.display.list_all_windows()) {
             if (other === excludeWindow)
@@ -213,7 +292,7 @@ class EdgePwaResolver {
         // null result: an early call (e.g. right at window creation, before
         // WM_CLASS/PID info has settled, or while a sibling window still
         // makes this process's identity ambiguous -- see
-        // _countOtherEdgeWindowsForPid) can resolve to null prematurely, and
+        // _countOtherWindowsForPid) can resolve to null prematurely, and
         // never revisiting it would lock that window out of PWA detection
         // for its entire lifetime.
         if (this._appCache.has(window)) {
@@ -269,7 +348,7 @@ class EdgePwaResolver {
     // is built at window-creation time by calling its original, unpatched
     // get_window_app() internally -- it never consults the JS-overridden
     // version above, so it always attributes every PWA window to the generic
-    // Edge app instead. get_windows()/get_running() are patched separately
+    // browser app instead. get_windows()/get_running() are patched separately
     // (below) to correct for this, using the same per-window resolution.
     getWindowsForApp(app, originalWindows) {
         if (!app)
@@ -331,15 +410,16 @@ class EdgePwaResolver {
         this._windowSignalIds.clear();
 
         this._appCache = new WeakMap();
-        this._appIdToDesktopId = null;
+        this._chromiumAppIdMap = null;
+        this._firefoxPwaSiteIdMap = null;
         this._pwaDesktopIds.clear();
         this._pwaAppWindowCounts.clear();
     }
 }
 
-export default class EdgePwaIconExtension extends Extension {
+export default class PwaSeparationExtension extends Extension {
     enable() {
-        this._resolver = new EdgePwaResolver();
+        this._resolver = new PwaResolver();
 
         const extension = this;
         this._originalGetWindowApp = Shell.WindowTracker.prototype.get_window_app;
@@ -371,13 +451,6 @@ export default class EdgePwaIconExtension extends Extension {
         };
         Shell.AppSystem.prototype.get_running = this._patchedGetRunning;
 
-        // Clicking a Dash/pinned PWA icon should focus its existing window
-        // rather than launching a new instance. Shell.App.activate()'s own
-        // C implementation decides that based on the same broken internal
-        // state Shell.App:state uses (see below), so it never recognizes a
-        // PWA as already running. Override activate() for resolved PWA apps
-        // only, using our own get_windows() (already patched, above) as the
-        // source of truth; every other app keeps the original behavior.
         this._originalActivate = Shell.App.prototype.activate;
         this._patchedActivate = function (...args) {
             if (!extension._resolver.isPwaApp(this))
@@ -394,13 +467,6 @@ export default class EdgePwaIconExtension extends Extension {
         };
         Shell.App.prototype.activate = this._patchedActivate;
 
-        // Best-effort fix for the Dash running-indicator dot: Shell.App:state
-        // is a GObject property backed by the same internal C-side tracking
-        // as get_windows()/get_running(), so it never reports RUNNING for a
-        // PWA app even while its windows are open. Only attempt this if this
-        // GNOME Shell version actually exposes "state" as a plain accessor
-        // property on the prototype (as of writing it does); if not, skip
-        // rather than risk breaking property access for every Shell.App.
         this._originalStateDescriptor =
             Object.getOwnPropertyDescriptor(Shell.App.prototype, 'state');
         if (this._originalStateDescriptor &&
@@ -423,18 +489,13 @@ export default class EdgePwaIconExtension extends Extension {
         } else {
             this._originalStateDescriptor = null;
             console.warn(
-                '[pwa-icons] Shell.App "state" is not a plain accessor ' +
+                '[pwa-separation] Shell.App "state" is not a plain accessor ' +
                 'property on this GNOME Shell version; the Dash running dot ' +
                 'may not reflect running PWAs.');
         }
     }
 
     disable() {
-        // Each restore below only fires if this extension's own patch is still
-        // in place. Another extension may have patched the same Shell
-        // prototype method/property after this one enabled; blindly restoring
-        // our saved "original" in that case would erase that extension's
-        // patch instead of just undoing ours.
         const currentStateDescriptor =
             Object.getOwnPropertyDescriptor(Shell.App.prototype, 'state');
         if (this._originalStateDescriptor &&
