@@ -8,6 +8,13 @@ import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 const CHROMIUM_BINARY_RE = /^(google-chrome|chrome|chromium|chromium-browser|brave|brave-browser|vivaldi|vivaldi-stable|opera|microsoft-edge|msedge)(-(beta|dev|canary|nightly|unstable|snapshot))?$/i;
 const APP_ID_RE = /--app-id=([A-Za-z0-9]+)/;
 const CRX_WM_CLASS_RE = /^crx_+([A-Za-z0-9]+)$/i;
+// Newer Edge builds observed setting wm_class_instance to
+// "<binary>-_<app-id>-<profile-directory>" (e.g.
+// "msedge-_eoficlgicibekocmfdomjbfnjmehnhcd-Default") instead of the legacy
+// "crx_<app-id>" form. Chrome extension/app ids are always a 32-character
+// string from the a-p alphabet, so that's matched directly rather than
+// relying on a specific binary-name or profile-directory prefix/suffix.
+const PROFILE_WM_CLASS_RE = /-_([a-p]{32})-/i;
 const FFPWA_WM_CLASS_RE = /^FFPWA-([0-9A-HJKMNP-TV-Z]{26})$/i;
 
 function isChromiumExecutable(pid) {
@@ -68,11 +75,11 @@ function tryMatchGetter(getter, regex) {
 }
 
 function extractAppIdFromWindow(window) {
-    // WM_CLASS is an instance/class pair. Chromium-family browsers set the
-    // per-app "crx_<app-id>" value on the *instance* part
-    // (get_wm_class_instance()) and leave the *class* part (get_wm_class())
-    // as a generic string shared by every window -- reading get_wm_class()
-    // here never matches any window, PWA or not.
+    // WM_CLASS is an instance/class pair. Chromium-family browsers set a
+    // per-app value on the *instance* part (get_wm_class_instance()) and
+    // leave the *class* part (get_wm_class()) as a generic string shared by
+    // every window -- reading get_wm_class() here never matches any window,
+    // PWA or not.
     //
     // This is what desktop files record as StartupWMClass, set individually
     // per window at window-creation time. This stays correct even when
@@ -83,7 +90,8 @@ function extractAppIdFromWindow(window) {
     // second PWA under the same profile does not spawn a new --app-id=...
     // process, so cmdline-based extraction alone misidentifies every PWA
     // window in that process as the first one launched.
-    return tryMatchGetter(() => window.get_wm_class_instance(), CRX_WM_CLASS_RE);
+    return tryMatchGetter(() => window.get_wm_class_instance(), CRX_WM_CLASS_RE) ??
+        tryMatchGetter(() => window.get_wm_class_instance(), PROFILE_WM_CLASS_RE);
 }
 
 function extractFirefoxPwaSiteId(window) {
@@ -198,7 +206,7 @@ class PwaResolver {
             if (!appId) {
                 const otherCount = this._countOtherWindowsForPid(pid, window);
                 if (otherCount > 0) {
-                    console.debug(
+                    console.log(
                         `[pwa-separation] pid=${pid} wm_class_instance=${window.get_wm_class_instance()} ` +
                         `title="${window.get_title()}" -> no app-id from WM_CLASS, ${otherCount} ` +
                         'other window(s) share this pid, refusing cmdline fallback');
@@ -208,14 +216,14 @@ class PwaResolver {
                 source = 'cmdline';
             }
             if (!appId) {
-                console.debug(
+                console.log(
                     `[pwa-separation] pid=${pid} wm_class_instance=${window.get_wm_class_instance()} ` +
                     `title="${window.get_title()}" -> no app-id resolved`);
                 return null;
             }
 
             const desktopId = this._lookupDesktopId('chromium', appId);
-            console.debug(
+            console.log(
                 `[pwa-separation] pid=${pid} wm_class_instance=${window.get_wm_class_instance()} ` +
                 `title="${window.get_title()}" appId=${appId} (via ${source}) -> ` +
                 `desktopId=${desktopId ?? 'none'}`);
@@ -225,7 +233,7 @@ class PwaResolver {
         const siteId = extractFirefoxPwaSiteId(window);
         if (siteId) {
             const desktopId = this._lookupDesktopId('firefoxPwa', siteId);
-            console.debug(
+            console.log(
                 `[pwa-separation] pid=${pid} siteId=${siteId} -> desktopId=${desktopId ?? 'none'}`);
             return this._resolveDesktopId(desktopId);
         }
@@ -429,11 +437,18 @@ export default class PwaSeparationExtension extends Extension {
         };
         Shell.AppSystem.prototype.get_running = this._patchedGetRunning;
 
+        // Not gated to isPwaApp(): the native implementation picks its
+        // most-recently-used window from Shell.App's own internal C-side
+        // window list, which (like get_windows()/get_n_windows()/
+        // get_running(), above) is built from the original unpatched
+        // get_window_app() -- so the *parent browser's* app also
+        // misattributes every PWA window as its own there. Left ungated,
+        // clicking the parent browser's Dash icon could activate a more
+        // recently used PWA window instead of a genuine browser window.
+        // Using this.get_windows() (already corrected per-app above) fixes
+        // both directions with the same logic.
         this._originalActivate = Shell.App.prototype.activate;
         this._patchedActivate = function (...args) {
-            if (!extension._resolver.isPwaApp(this))
-                return extension._originalActivate.call(this, ...args);
-
             const windows = this.get_windows();
             if (windows.length === 0)
                 return extension._originalActivate.call(this, ...args);
@@ -444,6 +459,26 @@ export default class PwaSeparationExtension extends Extension {
             return undefined;
         };
         Shell.App.prototype.activate = this._patchedActivate;
+
+        // Shell.App.activate_window(window, timestamp) is what the default
+        // (app-grouped) Alt-Tab switcher calls on release, passing the exact
+        // Meta.Window to focus -- it does not go through activate() above.
+        // Its native implementation only proceeds if `window` is found in
+        // this app's own internal C-side window list, which (like
+        // get_windows()/get_n_windows()/get_running(), above) is built from
+        // the original unpatched get_window_app() and so never contains a
+        // resolved PWA's windows -- it silently does nothing instead of
+        // focusing the window. Bypassed entirely for a resolved PWA app,
+        // since the caller already obtained `window` from our patched
+        // get_windows() and it is known to genuinely belong to this app.
+        this._originalActivateWindow = Shell.App.prototype.activate_window;
+        this._patchedActivateWindow = function (window, timestamp) {
+            if (!extension._resolver.isPwaApp(this) || !window)
+                return extension._originalActivateWindow.call(this, window, timestamp);
+            Main.activateWindow(window, timestamp);
+            return undefined;
+        };
+        Shell.App.prototype.activate_window = this._patchedActivateWindow;
 
         this._originalStateDescriptor =
             Object.getOwnPropertyDescriptor(Shell.App.prototype, 'state');
@@ -471,9 +506,68 @@ export default class PwaSeparationExtension extends Extension {
                 'property on this GNOME Shell version; the Dash running dot ' +
                 'may not reflect running PWAs.');
         }
+
+        // Shell.WindowTracker:focus-app is, like Shell.App:state above,
+        // computed from Shell.WindowTracker's internal C-side bookkeeping
+        // rather than derived by calling the JS-overridden get_window_app()
+        // -- so it always reports the generic browser app as focused while a
+        // PWA window actually has focus. This is what Dash-to-Dock/Ubuntu
+        // Dock (and any other dock extension that highlights the focused
+        // app) consult to decide which icon to highlight.
+        this._originalFocusAppDescriptor =
+            Object.getOwnPropertyDescriptor(Shell.WindowTracker.prototype, 'focus_app');
+        if (this._originalFocusAppDescriptor &&
+            typeof this._originalFocusAppDescriptor.get === 'function') {
+            const originalFocusAppGetter = this._originalFocusAppDescriptor.get;
+            this._patchedFocusAppGetter = function () {
+                const focusWindow = global.display.focus_window;
+                if (focusWindow) {
+                    const resolved = extension._resolver.resolveApp(focusWindow);
+                    if (resolved)
+                        return resolved;
+                }
+                return originalFocusAppGetter.call(this);
+            };
+            Object.defineProperty(Shell.WindowTracker.prototype, 'focus_app', {
+                configurable: true,
+                enumerable: this._originalFocusAppDescriptor.enumerable,
+                get: this._patchedFocusAppGetter,
+            });
+
+            // The C side only emits notify::focus-app when its own
+            // (unpatched) idea of the focused app changes -- which never
+            // happens when focus moves between a PWA window and its parent
+            // browser, since both resolve to the same app internally. Forward
+            // every focus-window change as a focus-app notification so
+            // listeners (e.g. a dock's focused-icon highlight) re-read the
+            // now-corrected property.
+            this._focusWindowChangedId = global.display.connect('notify::focus-window', () => {
+                Shell.WindowTracker.get_default().notify('focus-app');
+            });
+        } else {
+            this._originalFocusAppDescriptor = null;
+            console.warn(
+                '[pwa-separation] Shell.WindowTracker "focus-app" is not a ' +
+                'plain accessor property on this GNOME Shell version; dock ' +
+                'extensions may still highlight the parent browser as ' +
+                'focused instead of a running PWA.');
+        }
     }
 
     disable() {
+        if (this._focusWindowChangedId) {
+            global.display.disconnect(this._focusWindowChangedId);
+            this._focusWindowChangedId = null;
+        }
+
+        const currentFocusAppDescriptor =
+            Object.getOwnPropertyDescriptor(Shell.WindowTracker.prototype, 'focus_app');
+        if (this._originalFocusAppDescriptor &&
+            currentFocusAppDescriptor?.get === this._patchedFocusAppGetter)
+            Object.defineProperty(Shell.WindowTracker.prototype, 'focus_app', this._originalFocusAppDescriptor);
+        this._originalFocusAppDescriptor = null;
+        this._patchedFocusAppGetter = null;
+
         const currentStateDescriptor =
             Object.getOwnPropertyDescriptor(Shell.App.prototype, 'state');
         if (this._originalStateDescriptor &&
@@ -481,6 +575,11 @@ export default class PwaSeparationExtension extends Extension {
             Object.defineProperty(Shell.App.prototype, 'state', this._originalStateDescriptor);
         this._originalStateDescriptor = null;
         this._patchedStateGetter = null;
+
+        if (Shell.App.prototype.activate_window === this._patchedActivateWindow)
+            Shell.App.prototype.activate_window = this._originalActivateWindow;
+        this._originalActivateWindow = null;
+        this._patchedActivateWindow = null;
 
         if (Shell.App.prototype.activate === this._patchedActivate)
             Shell.App.prototype.activate = this._originalActivate;
