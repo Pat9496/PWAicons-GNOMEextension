@@ -98,12 +98,9 @@ function extractFirefoxPwaSiteId(window) {
     // Unlike Chromium's WM_CLASS convention (always the instance part),
     // it's unconfirmed which half of the WM_CLASS pair firefoxpwa's --class
     // flag sets, so both are tried.
-    const instanceMatch = tryMatchGetter(() => window.get_wm_class_instance(), FFPWA_WM_CLASS_RE);
-    if (instanceMatch)
-        return instanceMatch.toUpperCase();
-
-    const classMatch = tryMatchGetter(() => window.get_wm_class(), FFPWA_WM_CLASS_RE);
-    return classMatch ? classMatch.toUpperCase() : null;
+    const match = tryMatchGetter(() => window.get_wm_class_instance(), FFPWA_WM_CLASS_RE) ??
+        tryMatchGetter(() => window.get_wm_class(), FFPWA_WM_CLASS_RE);
+    return match ? match.toUpperCase() : null;
 }
 
 // Builds a Map from whatever id `extractIdFromAppInfo` derives from each
@@ -142,7 +139,7 @@ function extractFirefoxPwaSiteIdFromAppInfo(appInfo) {
 }
 
 class PwaResolver {
-    constructor() {
+    constructor(getNativeAppForWindow) {
         // Each entry lazily builds (and, on a cache miss, rebuilds once --
         // in case the AppInfoMonitor 'changed' signal below was missed) a
         // Map from whatever id its `builder` extracts to a desktop-file id.
@@ -150,10 +147,17 @@ class PwaResolver {
             chromium: {map: null, builder: () => buildIdMap(extractChromiumAppIdFromAppInfo)},
             firefoxPwa: {map: null, builder: () => buildIdMap(extractFirefoxPwaSiteIdFromAppInfo)},
         };
+        this._getNativeAppForWindow = getNativeAppForWindow;
         this._appCache = new WeakMap();
+        // Window -> the app that GNOME Shell's own (unpatched) native
+        // get_window_app() would have attributed the window to, recorded
+        // only when that differs from our resolved PWA app -- i.e. the
+        // parent browser app whose running/state indicator needs to be
+        // corrected and re-notified alongside the PWA's own.
+        this._shadowedAppCache = new WeakMap();
         this._windowSignalIds = new Map();
         this._pwaDesktopIds = new Set();
-        this._pwaAppWindowCounts = new Map();
+        this._appWindowCounts = new Map();
 
         this._appInfoMonitor = Gio.AppInfoMonitor.get();
         this._appInfoChangedId = this._appInfoMonitor.connect('changed', () => {
@@ -164,10 +168,13 @@ class PwaResolver {
 
     _lookupDesktopId(family, id) {
         const entry = this._idMaps[family];
-        if (!entry.map)
+        let rebuilt = false;
+        if (!entry.map) {
             entry.map = entry.builder();
+            rebuilt = true;
+        }
         let desktopId = entry.map.get(id);
-        if (!desktopId) {
+        if (!desktopId && !rebuilt) {
             entry.map = entry.builder();
             desktopId = entry.map.get(id);
         }
@@ -264,11 +271,33 @@ class PwaResolver {
 
         const id = window.connect('unmanaged', () => {
             const app = this._appCache.get(window);
+            const shadowed = this._shadowedAppCache.get(window);
             this._appCache.delete(window);
+            this._shadowedAppCache.delete(window);
             this._windowSignalIds.delete(window);
             this._maybeNotifyStateChange(app);
+            this._maybeNotifyStateChange(shadowed);
         });
         this._windowSignalIds.set(window, id);
+    }
+
+    // Records, the first time `window` resolves to `app`, whichever app
+    // GNOME Shell's own native get_window_app() would have attributed the
+    // window to -- if that's a different app, it's the parent browser app
+    // whose window list/state is currently wrong because of this window,
+    // and needs the same notify('state') treatment as the PWA app itself.
+    _trackShadowedApp(window, app) {
+        if (this._shadowedAppCache.has(window))
+            return;
+
+        let nativeApp;
+        try {
+            nativeApp = this._getNativeAppForWindow(window);
+        } catch (e) {
+            return;
+        }
+        if (nativeApp && nativeApp.get_id() !== app.get_id())
+            this._shadowedAppCache.set(window, nativeApp);
     }
 
     resolveApp(window) {
@@ -281,18 +310,18 @@ class PwaResolver {
         // _countOtherWindowsForPid) can resolve to null prematurely, and
         // never revisiting it would lock that window out of PWA detection
         // for its entire lifetime.
-        if (this._appCache.has(window)) {
-            const cached = this._appCache.get(window);
-            if (cached)
-                return cached;
-        }
+        const cached = this._appCache.get(window);
+        if (cached)
+            return cached;
 
         const app = this._computeAppForWindow(window);
-        if (app)
-            this._appCache.set(window, app);
         this._trackWindow(window);
-        if (app)
+        if (app) {
+            this._appCache.set(window, app);
+            this._trackShadowedApp(window, app);
             this._maybeNotifyStateChange(app);
+            this._maybeNotifyStateChange(this._shadowedAppCache.get(window));
+        }
         return app;
     }
 
@@ -301,19 +330,19 @@ class PwaResolver {
     // never re-consults the JS-overridden get_window_app(). Reading app.state
     // for a PWA app therefore always reports STOPPED even while its windows are
     // open, unless something else notifies listeners (e.g. the Dash running-dot)
-    // that it may have changed. Call this after any window gets added to, or
-    // removed from, a PWA app's resolved window set.
+    // that it may have changed. The same staleness cuts the other way for the
+    // parent browser app: it can keep reporting RUNNING purely because of a
+    // window that's actually been reattributed to a PWA. Call this after any
+    // window gets added to, or removed from, either app's resolved window set
+    // -- both the PWA app and its shadowed native app (see _trackShadowedApp).
     _maybeNotifyStateChange(app) {
         if (!app)
             return;
 
         const id = app.get_id();
-        if (!this._pwaDesktopIds.has(id))
-            return;
-
         const count = app.get_windows().length;
-        const previousCount = this._pwaAppWindowCounts.get(id) ?? 0;
-        this._pwaAppWindowCounts.set(id, count);
+        const previousCount = this._appWindowCounts.get(id) ?? 0;
+        this._appWindowCounts.set(id, count);
 
         if ((previousCount === 0) !== (count === 0)) {
             try {
@@ -396,30 +425,32 @@ class PwaResolver {
         this._windowSignalIds.clear();
 
         this._appCache = new WeakMap();
+        this._shadowedAppCache = new WeakMap();
         for (const entry of Object.values(this._idMaps))
             entry.map = null;
         this._pwaDesktopIds.clear();
-        this._pwaAppWindowCounts.clear();
+        this._appWindowCounts.clear();
     }
 }
 
 export default class PwaSeparationExtension extends Extension {
     enable() {
-        this._resolver = new PwaResolver();
-
         const extension = this;
         this._originalGetWindowApp = Shell.WindowTracker.prototype.get_window_app;
-        this._patchedGetWindowApp = function (...args) {
-            const app = extension._resolver.resolveApp(args[0]);
+        this._resolver = new PwaResolver(
+            window => extension._originalGetWindowApp.call(Shell.WindowTracker.get_default(), window));
+
+        this._patchedGetWindowApp = function (window) {
+            const app = extension._resolver.resolveApp(window);
             if (app)
                 return app;
-            return extension._originalGetWindowApp.call(this, ...args);
+            return extension._originalGetWindowApp.call(this, window);
         };
         Shell.WindowTracker.prototype.get_window_app = this._patchedGetWindowApp;
 
         this._originalAppGetWindows = Shell.App.prototype.get_windows;
-        this._patchedAppGetWindows = function (...args) {
-            const original = extension._originalAppGetWindows.call(this, ...args);
+        this._patchedAppGetWindows = function () {
+            const original = extension._originalAppGetWindows.call(this);
             return extension._resolver.getWindowsForApp(this, original);
         };
         Shell.App.prototype.get_windows = this._patchedAppGetWindows;
@@ -431,8 +462,8 @@ export default class PwaSeparationExtension extends Extension {
         Shell.App.prototype.get_n_windows = this._patchedAppGetNWindows;
 
         this._originalGetRunning = Shell.AppSystem.prototype.get_running;
-        this._patchedGetRunning = function (...args) {
-            const original = extension._originalGetRunning.call(this, ...args);
+        this._patchedGetRunning = function () {
+            const original = extension._originalGetRunning.call(this);
             return extension._resolver.getRunningApps(original);
         };
         Shell.AppSystem.prototype.get_running = this._patchedGetRunning;
@@ -487,11 +518,27 @@ export default class PwaSeparationExtension extends Extension {
             const originalStateGetter = this._originalStateDescriptor.get;
             this._patchedStateGetter = function () {
                 const original = originalStateGetter.call(this);
-                if (original !== Shell.AppState.STOPPED)
+
+                if (extension._resolver.isPwaApp(this)) {
+                    if (original === Shell.AppState.STOPPED &&
+                        this.get_windows().length > 0)
+                        return Shell.AppState.RUNNING;
                     return original;
-                if (extension._resolver.isPwaApp(this) &&
-                    this.get_windows().length > 0)
-                    return Shell.AppState.RUNNING;
+                }
+
+                // The reverse staleness: this app (e.g. a parent browser)
+                // can still report RUNNING purely because native's own
+                // window-tracking counts a window that our resolver has
+                // reattributed to a PWA. Only demote when *every* window
+                // native attributes to this app turned out to belong
+                // elsewhere -- if any of them are still genuinely this
+                // app's own, get_windows() below is non-empty and nothing
+                // changes.
+                if (original === Shell.AppState.RUNNING) {
+                    const nativeWindows = extension._originalAppGetWindows.call(this);
+                    if (nativeWindows.length > 0 && this.get_windows().length === 0)
+                        return Shell.AppState.STOPPED;
+                }
                 return original;
             };
             Object.defineProperty(Shell.App.prototype, 'state', {

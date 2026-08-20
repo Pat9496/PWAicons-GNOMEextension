@@ -2,6 +2,6 @@
     "uuid": "pwa-separation@pat9496",
     "name": "PWA Separation",
     "description": "Shows each installed PWA from Chromium-family browsers (Edge, Chrome, Brave, Vivaldi, Opera, etc.) and Firefox via firefoxpwa as its own app with its own icon in Alt-Tab, the Overview, and the Dash, instead of grouping it under the parent browser's generic icon.",
-    "version": "0.5",
+    "version": "1.0",
     "shell-version": ["45", "46", "47", "48", "49", "50"]
 }

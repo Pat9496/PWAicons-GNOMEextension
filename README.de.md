@@ -1,7 +1,7 @@
 # PWA-Trennung
 
 ![GNOME Shell 45-50](https://img.shields.io/badge/GNOME%20Shell-45--50-blue)
-![Version 0.5](https://img.shields.io/badge/version-0.5-blue)
+![Version 1.0](https://img.shields.io/badge/version-1.0-blue)
 
 [English](README.md) | **Deutsch**
 

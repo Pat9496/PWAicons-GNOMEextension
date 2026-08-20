@@ -1,7 +1,7 @@
 # PWA Separation
 
 ![GNOME Shell 45-50](https://img.shields.io/badge/GNOME%20Shell-45--50-blue)
-![Version 0.5](https://img.shields.io/badge/version-0.5-blue)
+![Version 1.0](https://img.shields.io/badge/version-1.0-blue)
 
 **English** | [Deutsch](README.de.md)
 
@@ -14,6 +14,7 @@
 - [Debugging](#debugging)
 - [Limitations](#limitations)
 - [Credits](#credits)
+- [Changelog](CHANGELOG.md)
 
 A GNOME Shell extension that makes Progressive Web Apps (PWAs) show up as their own distinct apps, with
 their own icon, instead of being grouped under the parent browser's generic icon in the Overview, Alt-Tab,
