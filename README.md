@@ -129,9 +129,10 @@ python3 -c "import json; json.load(open('metadata.json'))"
   fabricated identity.
 - The Dash's running-indicator dot and Dash-click activation (focusing an existing PWA window instead of
   launching a new one) are implemented but not yet confirmed working in a live GNOME Shell session.
-- Chromium-family browser generalization (Chrome, Chromium, Brave, Vivaldi, Opera) has not been
-  live-tested with any browser besides Microsoft Edge. Treat as unverified until confirmed with each
-  specific browser.
+- Chromium-family browser generalization (Chrome, Chromium, Brave, Vivaldi, Opera): development and
+  live testing has focused on Microsoft Edge, driven by the maintainer's primary use case of Teams and
+  Outlook installed as PWAs. The extension's detection logic is designed generically to work with any
+  installed PWA across all Chromium-family browsers, but remains unverified for browsers other than Edge.
 - Firefox/firefoxpwa support is WM_CLASS-only with no cmdline fallback. When multiple firefoxpwa PWAs
   share one Firefox profile, a known upstream bug (filips123/PWAsForFirefox#80) can merge all their
   windows into a single WM_CLASS, defeating per-window identification — this extension has no workaround

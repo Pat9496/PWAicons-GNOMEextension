@@ -5,16 +5,16 @@ import Shell from 'gi://Shell';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 
-const CHROMIUM_BINARY_RE = /^(google-chrome|chrome|chromium|chromium-browser|brave|brave-browser|vivaldi|vivaldi-stable|opera|microsoft-edge|msedge)(-(beta|dev|canary|nightly|unstable|snapshot))?$/i;
+const CHROMIUM_BINARY_RE = /^(google-chrome|chrome|chromium|chromium-browser|brave|brave-browser|vivaldi|vivaldi-bin|vivaldi-stable|opera|microsoft-edge|msedge)(-(beta|dev|developer|canary|nightly|unstable|snapshot))?$/i;
 const APP_ID_RE = /--app-id=([A-Za-z0-9]+)/;
-const CRX_WM_CLASS_RE = /^crx_+([A-Za-z0-9]+)$/i;
+const CRX_WM_CLASS_RE = /^crx_([A-Za-z0-9]+)$/i;
 // Newer Edge builds observed setting wm_class_instance to
-// "<binary>-_<app-id>-<profile-directory>" (e.g.
-// "msedge-_eoficlgicibekocmfdomjbfnjmehnhcd-Default") instead of the legacy
+// "<binary>-<app-id>-<profile-directory>" (e.g.
+// "msedge-eoficlgicibekocmfdomjbfnjmehnhcd-Default") instead of the legacy
 // "crx_<app-id>" form. Chrome extension/app ids are always a 32-character
 // string from the a-p alphabet, so that's matched directly rather than
 // relying on a specific binary-name or profile-directory prefix/suffix.
-const PROFILE_WM_CLASS_RE = /-_([a-p]{32})-/i;
+const PROFILE_WM_CLASS_RE = /-([a-p]{32})-/i;
 const FFPWA_WM_CLASS_RE = /^FFPWA-([0-9A-HJKMNP-TV-Z]{26})$/i;
 
 function isChromiumExecutable(pid) {
@@ -274,9 +274,9 @@ class PwaResolver {
             const shadowed = this._shadowedAppCache.get(window);
             this._appCache.delete(window);
             this._shadowedAppCache.delete(window);
-            this._windowSignalIds.delete(window);
             this._maybeNotifyStateChange(app);
             this._maybeNotifyStateChange(shadowed);
+            this._windowSignalIds.delete(window);
         });
         this._windowSignalIds.set(window, id);
     }
