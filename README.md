@@ -3,7 +3,9 @@
 ![GNOME Shell 45-50](https://img.shields.io/badge/GNOME%20Shell-45--50-blue)
 ![Version 1.0](https://img.shields.io/badge/version-1.0-blue)
 
-**English** | [Deutsch](README.de.md)
+A GNOME Shell extension that makes Progressive Web Apps (PWAs) show up as their own distinct apps, with their own icon, instead of being grouped under the parent browser's generic icon in the Overview, Alt-Tab, the Dash, and third-party taskbar-style extensions. Supports PWAs installed from any Chromium-family browser (Chrome, Chromium, Edge, Brave, Vivaldi, Opera) and provides best-effort support for Firefox PWAs installed via the third-party firefoxpwa addon.
+
+[Deutsche Version](README.de.md)
 
 ## Table of Contents
 
@@ -15,12 +17,6 @@
 - [Limitations](#limitations)
 - [Credits](#credits)
 - [Changelog](CHANGELOG.md)
-
-A GNOME Shell extension that makes Progressive Web Apps (PWAs) show up as their own distinct apps, with
-their own icon, instead of being grouped under the parent browser's generic icon in the Overview, Alt-Tab,
-the Dash, and third-party taskbar-style extensions. Supports PWAs installed from any Chromium-family
-browser (Chrome, Chromium, Edge, Brave, Vivaldi, Opera) and provides best-effort support for Firefox PWAs
-installed via the third-party firefoxpwa addon.
 
 ## The problem
 
